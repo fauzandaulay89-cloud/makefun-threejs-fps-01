@@ -1,236 +1,277 @@
-// Combat: one code path for the player and every bot. A shot is a ray from
-// the shooter's eye with spread; the first thing it meets is either the map
-// (an impact spark) or an actor's head or torso mesh (damage, head shots
-// multiply). Armour absorbs half of what remains. Flashbangs are thrown
-// projectiles with a short fuse: anyone with line of sight who is facing the
-// burst is blinded for up to ~2.8 s. All hot-loop vectors are reused.
-import * as THREE from 'three';
+// combat.js — Hitscan shooting: spread, recoil, ray vs walls and bodies,
+// damage with headshots and armour. Pure math, no rendering, no DOM.
+//
+// A shot is a ray from the shooter's eye. The ray first meets the nearest
+// wall (rayWalls) or the nearest agent capsule (body segment + head sphere);
+// the nearer one wins. Spread is a cone around the aim direction sampled
+// with the match RNG, so the same seed replays the same shots.
 
-const FLASH_FUSE = 1.4;
-const FLASH_RANGE = 26;
+import { MAP, rayWalls } from './map.js';
+import { WEAPONS, applyArmor } from './weapons.js';
 
-export function createCombat({ scene, world, effects, audio, random }) {
-  const raycaster = new THREE.Raycaster();
-  raycaster.far = 120;
-  const actors = [];
-  const grenades = [];
-  const tmpDir = new THREE.Vector3();
-  const tmpFrom = new THREE.Vector3();
-  const tmpTo = new THREE.Vector3();
-  const tmpEye = new THREE.Vector3();
+const EYE = MAP.eyeHeight;
+const CROUCH_EYE = MAP.crouchEye;
 
-  const grenadeGeo = new THREE.SphereGeometry(0.09, 10, 8);
-  const grenadeMat = new THREE.MeshBasicMaterial({ color: 0xffe6b0 });
-
-  // Flat cache of every actor hit mesh, rebuilt when an actor registers.
-  // A shot raycasts the map and this list separately and takes the nearer
-  // hit, so no per-shot array is built.
-  let targetMeshes = null;
-  function getTargetMeshes() {
-    if (targetMeshes) return targetMeshes;
-    targetMeshes = [];
-    for (const a of actors) targetMeshes.push(...a.hitMeshes);
-    return targetMeshes;
-  }
-
-  function buildInvisibleHitMeshes(actor) {
-    const group = new THREE.Group();
-    const mat = new THREE.MeshBasicMaterial({ visible: false });
-    const torso = new THREE.Mesh(new THREE.BoxGeometry(0.52, 0.78, 0.3), mat);
-    torso.position.y = 1.05;
-    torso.userData.actor = actor;
-    torso.userData.part = 'torso';
-    const head = new THREE.Mesh(new THREE.SphereGeometry(0.17, 10, 8), mat);
-    head.position.y = 1.62;
-    head.userData.actor = actor;
-    head.userData.part = 'head';
-    group.add(torso, head);
-    scene.add(group);
-    return { group, meshes: [torso, head] };
-  }
-
-  function registerActor(actor, hitMeshes) {
-    // hitMeshes: [{mesh, part}] built by the caller (bot bodies), or null for
-    // an invisible capsule (the player, who has no visible body of their own).
-    if (!hitMeshes) {
-      const built = buildInvisibleHitMeshes(actor);
-      actor.hitGroup = built.group;
-      actor.hitMeshes = built.meshes;
-    } else {
-      for (const { mesh, part } of hitMeshes) {
-        mesh.userData.actor = actor;
-        mesh.userData.part = part;
-      }
-      actor.hitMeshes = hitMeshes.map((h) => h.mesh);
-    }
-    targetMeshes = null;
-    actor.alive = true;
-    actor.health = 100;
-    actor.flashTime = 0;
-    actors.push(actor);
-    return actor;
-  }
-
-  function damage(victim, amount, part) {
-    if (!victim.alive) return { killed: false, dealt: 0 };
-    let dealt = amount;
-    if (victim.armor > 0) {
-      const absorbed = Math.min(victim.armor, dealt * 0.5);
-      victim.armor -= absorbed;
-      dealt -= absorbed;
-    }
-    victim.health -= dealt;
-    if (victim.health <= 0) {
-      victim.health = 0;
-      victim.alive = false;
-      return { killed: true, dealt, part };
-    }
-    return { killed: false, dealt, part };
-  }
-
-  function shoot(shooter, spread, muzzle) {
-    const loadout = shooter.loadout;
-    if (!loadout.takeRound()) return null;
-    loadout.pullTrigger();
-    const def = loadout.def();
-    shooter.mover.eyePosition(tmpFrom);
-    tmpDir.set(0, 0, -1).applyEuler(new THREE.Euler(shooter.mover.state.pitch, shooter.mover.state.yaw, 0, 'YXZ'));
-    tmpDir.x += (random() * 2 - 1) * spread;
-    tmpDir.y += (random() * 2 - 1) * spread;
-    tmpDir.z += (random() * 2 - 1) * spread;
-    tmpDir.normalize();
-    scene.updateMatrixWorld(true);
-    raycaster.set(tmpFrom, tmpDir);
-    const wallHit = raycaster.intersectObjects(world.shootables, false)[0] ?? null;
-    const bodyHits = raycaster.intersectObjects(getTargetMeshes(), false);
-    let bodyHit = null;
-    for (const h of bodyHits) {
-      const a = h.object.userData.actor;
-      if (a && a.alive && a !== shooter) {
-        bodyHit = h;
-        break;
-      }
-    }
-    const hit = bodyHit && (!wallHit || bodyHit.distance < wallHit.distance) ? bodyHit : wallHit;
-    const muzzlePos = muzzle ?? tmpFrom;
-    if (!hit) {
-      tmpTo.copy(tmpFrom).addScaledVector(tmpDir, 60);
-      effects.tracer(muzzlePos, tmpTo);
-      return { hit: false };
-    }
-    tmpTo.copy(hit.point);
-    effects.tracer(muzzlePos, tmpTo);
-    const actorHit = hit.object.userData.actor;
-    if (!actorHit || !actorHit.alive) {
-      effects.impact(hit.point, false);
-      return { hit: false, point: hit.point };
-    }
-    const part = hit.object.userData.part;
-    const mult = part === 'head' ? def.headMult : 1;
-    const result = damage(actorHit, def.damage * mult, part);
-    effects.impact(hit.point, true);
-    return { hit: true, victim: actorHit, part, killed: result.killed, dealt: result.dealt, point: hit.point };
-  }
-
-  function lineOfSight(from, to) {
-    tmpDir.subVectors(to, from);
-    const dist = tmpDir.length();
-    if (dist < 0.01) return true;
-    tmpDir.normalize();
-    raycaster.set(from, tmpDir);
-    raycaster.far = dist;
-    const hits = raycaster.intersectObjects(world.shootables, false);
-    raycaster.far = 120;
-    return hits.length === 0;
-  }
-
-  function throwFlash(thrower) {
-    if (thrower.loadout.grenades <= 0) return false;
-    thrower.loadout.grenades -= 1;
-    const mesh = new THREE.Mesh(grenadeGeo, grenadeMat);
-    thrower.mover.eyePosition(tmpFrom);
-    mesh.position.copy(tmpFrom);
-    tmpDir.set(0, 0, -1).applyEuler(new THREE.Euler(thrower.mover.state.pitch, thrower.mover.state.yaw, 0, 'YXZ'));
-    const vel = new THREE.Vector3(tmpDir.x * 15, tmpDir.y * 15 + 3.5, tmpDir.z * 15);
-    scene.add(mesh);
-    grenades.push({ mesh, vel, fuse: FLASH_FUSE, bounces: 0, thrower });
-    return true;
-  }
-
-  function detonate(g) {
-    const pos = g.mesh.position;
-    audio.flash();
-    effects.impact(pos, false);
-    for (const a of actors) {
-      if (!a.alive) continue;
-      a.mover.eyePosition(tmpEye);
-      tmpDir.subVectors(pos, tmpEye);
-      const dist = tmpDir.length();
-      if (dist > FLASH_RANGE) continue;
-      if (dist > 3 && !lineOfSight(tmpEye, pos)) continue;
-      // Facing the burst blinds fully; turned away, only a short dazzle.
-      tmpTo.set(0, 0, -1).applyEuler(new THREE.Euler(a.mover.state.pitch, a.mover.state.yaw, 0, 'YXZ'));
-      const facing = tmpDir.normalize().dot(tmpTo);
-      const factor = facing > 0.2 ? 1 : 0.35;
-      const strength = Math.max(0, 1 - dist / FLASH_RANGE) * factor;
-      a.flashTime = Math.max(a.flashTime, 0.35 + strength * 2.45);
-    }
-    scene.remove(g.mesh);
-  }
-
-  function stepGrenades(dt) {
-    for (let i = grenades.length - 1; i >= 0; i -= 1) {
-      const g = grenades[i];
-      g.fuse -= dt;
-      g.vel.y -= 14 * dt;
-      g.mesh.position.addScaledVector(g.vel, dt);
-      const p = g.mesh.position;
-      if (p.y <= 0.09) {
-        p.y = 0.09;
-        g.vel.y = Math.abs(g.vel.y) * 0.4;
-        g.vel.x *= 0.7;
-        g.vel.z *= 0.7;
-        g.bounces += 1;
-      }
-      if (g.fuse <= 0 || g.bounces >= 2) {
-        detonate(g);
-        grenades.splice(i, 1);
-      }
-    }
-  }
-
+/** Eye position of an agent (crouch lowers it). */
+export function eyeOf(agent) {
   return {
-    actors,
-    registerActor,
-    damage,
-    shoot,
-    lineOfSight,
-    throwFlash,
-    step(dt) {
-      stepGrenades(dt);
-      for (const a of actors) {
-        if (a.flashTime > 0) a.flashTime = Math.max(0, a.flashTime - dt);
-        // Keep the player's invisible hit meshes glued to their body.
-        if (a.hitGroup) {
-          a.hitGroup.position.copy(a.mover.state.position);
-          a.hitGroup.rotation.y = a.mover.state.yaw;
-          // Crouching lowers the capsule: scale the group down.
-          const s = a.mover.state.crouching ? 0.72 : 1;
-          a.hitGroup.scale.set(1, s, 1);
-        }
-      }
-    },
-    resetActor(actor) {
-      actor.alive = true;
-      actor.health = 100;
-      actor.flashTime = 0;
-      if (actor.hitGroup) actor.hitGroup.visible = true;
-    },
-    hideActor(actor) {
-      if (actor.hitGroup) actor.hitGroup.visible = false;
-    },
-    eyeOf(actor, out) {
-      return actor.mover.eyePosition(out ?? tmpEye);
-    },
+    x: agent.pos.x,
+    y: agent.pos.y + (agent.crouch ? CROUCH_EYE : EYE),
+    z: agent.pos.z,
   };
+}
+
+/** Aim direction from yaw/pitch (yaw 0 faces -z, i.e. north). */
+export function aimDir(yaw, pitch) {
+  const cp = Math.cos(pitch);
+  return {
+    x: -Math.sin(yaw) * cp,
+    y: Math.sin(pitch),
+    z: -Math.cos(yaw) * cp,
+  };
+}
+
+/** Current spread cone (radians) for an agent holding a weapon. */
+export function currentSpread(agent, weapon) {
+  const speed = Math.hypot(agent.vel.x, agent.vel.z);
+  let spread = weapon.spreadBase + agent.bloom;
+  if (speed > 0.5) spread += weapon.spreadMove * Math.min(1, speed / 4.2);
+  if (!agent.onGround) spread += weapon.spreadAir;
+  if (agent.crouch) spread *= 0.8;
+  return spread;
+}
+
+/**
+ * Ray vs an agent capsule: body is the segment y+0.25..y+1.45 (radius 0.38),
+ * head is a sphere at y+1.62 (radius 0.24). Returns {t, part} or null.
+ * The segment test is a ray-vs-cylinder approximation: sample the closest
+ * approach of the ray to the body axis, then check the radius.
+ */
+export function rayAgent(ox, oy, oz, dx, dy, dz, target, maxT) {
+  // Head sphere first (small, highest value).
+  const hx = target.pos.x;
+  const hy = target.pos.y + 1.62;
+  const hz = target.pos.z;
+  const hr = 0.24;
+  const ocx = ox - hx;
+  const ocy = oy - hy;
+  const ocz = oz - hz;
+  const b = ocx * dx + ocy * dy + ocz * dz;
+  const c = ocx * ocx + ocy * ocy + ocz * ocz - hr * hr;
+  const disc = b * b - c;
+  if (disc > 0) {
+    const t = -b - Math.sqrt(disc);
+    if (t > 0.01 && t < maxT) return { t, part: 'head' };
+  }
+  // Body: closest approach of the ray to the vertical axis segment.
+  // Project onto the XZ plane: the ray passes within radius of the axis,
+  // and the height at that point must be inside the body span.
+  const rx = target.pos.x - ox;
+  const rz = target.pos.z - oz;
+  const denom = dx * dx + dz * dz;
+  if (denom < 1e-9) return null;
+  let t = (rx * dx + rz * dz) / denom;
+  if (t < 0.01 || t > maxT) return null;
+  const px = ox + dx * t;
+  const pz = oz + dz * t;
+  const ddx = px - target.pos.x;
+  const ddz = pz - target.pos.z;
+  if (ddx * ddx + ddz * ddz > 0.38 * 0.38) return null;
+  const py = oy + dy * t;
+  if (py < target.pos.y + 0.2 || py > target.pos.y + 1.5) return null;
+  return { t, part: 'body' };
+}
+
+/**
+ * Fire one hitscan shot. Returns a result object describing the shot for
+ * the event log, tracer rendering and sound:
+ * { hit, victimId, part, damage, end: {x,y,z} (ray end / impact point),
+ *   blocked: bool }
+ * Applies damage and kill bookkeeping on the state.
+ */
+export function fireShot(state, shooter) {
+  const weapon = WEAPONS[shooter.weapon];
+  const eye = eyeOf(shooter);
+  const base = aimDir(shooter.yaw, shooter.pitch);
+  const spread = currentSpread(shooter, weapon);
+  // Sample a direction inside the spread cone with the match RNG.
+  const r = spread * Math.sqrt(state.rng.next());
+  const a = state.rng.next() * Math.PI * 2;
+  // Orthonormal basis around the aim direction.
+  let ux = -base.z;
+  let uy = 0;
+  let uz = base.x;
+  const ul = Math.hypot(ux, uy, uz) || 1;
+  ux /= ul;
+  uy /= ul;
+  uz /= ul;
+  const vx = base.y * uz - base.z * uy;
+  const vy = base.z * ux - base.x * uz;
+  const vz = base.x * uy - base.y * ux;
+  const dx = base.x + (ux * Math.cos(a) + vx * Math.sin(a)) * r;
+  const dy = base.y + (uy * Math.cos(a) + vy * Math.sin(a)) * r;
+  const dz = base.z + (uz * Math.cos(a) + vz * Math.sin(a)) * r;
+  const dl = Math.hypot(dx, dy, dz);
+  const ndx = dx / dl;
+  const ndy = dy / dl;
+  const ndz = dz / dl;
+
+  const maxT = weapon.range;
+  const wallT = rayWalls(eye.x, eye.y, eye.z, ndx, ndy, ndz, maxT);
+  let bestT = wallT;
+  let victim = null;
+  let part = null;
+  for (const other of state.agents) {
+    if (!other.alive || other.id === shooter.id) continue;
+    const hit = rayAgent(eye.x, eye.y, eye.z, ndx, ndy, ndz, other, maxT);
+    if (hit && hit.t < bestT) {
+      bestT = hit.t;
+      victim = other;
+      part = hit.part;
+    }
+  }
+
+  const end = {
+    x: eye.x + ndx * (bestT === Infinity ? maxT : bestT),
+    y: eye.y + ndy * (bestT === Infinity ? maxT : bestT),
+    z: eye.z + ndz * (bestT === Infinity ? maxT : bestT),
+  };
+  const result = {
+    hit: victim !== null,
+    victimId: victim ? victim.id : null,
+    part,
+    damage: 0,
+    end,
+    blocked: victim === null && wallT !== Infinity,
+    wallT,
+  };
+  // Queue a tracer for the renderer (bounded; the sim never reads it).
+  if (state.tracers && state.tracers.length < 48) {
+    state.tracers.push({
+      from: { x: eye.x, y: eye.y, z: eye.z },
+      to: end,
+      color: weapon.tracer,
+      shooterId: shooter.id,
+      blocked: result.blocked,
+    });
+  }
+  if (!victim) return result;
+
+  let damage = weapon.damage;
+  if (part === 'head') damage *= weapon.headMult;
+  // Distance falloff: full damage to 15 m, then down to 60% at max range.
+  const falloff = Math.max(0.6, 1 - (0.4 * Math.max(0, bestT - 15)) / Math.max(1, weapon.range - 15));
+  damage *= falloff;
+  const after = applyArmor(damage, victim.armor);
+  damage = after.damage;
+  victim.armor = after.armor;
+  victim.hp -= damage;
+  result.damage = damage;
+  shooter.shotsHit = (shooter.shotsHit || 0) + 1;
+  victim.lastAttackerId = shooter.id;
+  victim.lastDamageTick = state.tick;
+  if (victim.hp <= 0) {
+    victim.hp = 0;
+    victim.alive = false;
+    victim.deaths += 1;
+    shooter.kills += 1;
+    shooter.money = Math.min(16000, shooter.money + 300);
+    state.events.push({
+      tick: state.tick,
+      type: 'kill',
+      killerId: shooter.id,
+      victimId: victim.id,
+      headshot: part === 'head',
+      weapon: shooter.weapon,
+    });
+    // The spike drops to the nearest living attacker when its carrier dies.
+    if (state.spike.carrierId === victim.id) dropSpike(state, victim);
+    // Round-end is checked by the simulation step after each tick.
+  }
+  state.events.push({
+    tick: state.tick,
+    type: 'hit',
+    shooterId: shooter.id,
+    victimId: victim.id,
+    damage,
+    headshot: part === 'head',
+  });
+  return result;
+}
+
+/** The spike carrier died: the spike waits for a living attacker to pick up. */
+export function dropSpike(state, dead) {
+  state.spike.state = 'dropped';
+  state.spike.carrierId = null;
+  state.spike.pos = { x: dead.pos.x, z: dead.pos.z };
+  state.spike.dropTick = state.tick;
+  state.events.push({ tick: state.tick, type: 'spikeDropped', x: dead.pos.x, z: dead.pos.z });
+}
+
+/**
+ * Try to fire the shooter's weapon this tick. Handles fire interval,
+ * ammo, reload state and recoil bloom. Returns the shot result, or null
+ * when no shot was fired (cooling down, reloading, empty, or not firing).
+ * `wantFire` is the trigger state (held for autos, edge for semi-autos).
+ */
+export function tryFire(state, agent, wantFire, dt) {
+  const weapon = WEAPONS[agent.weapon];
+  agent.fireCooldown -= dt;
+  agent.bloom = Math.max(0, agent.bloom - dt * 0.09);
+  if (agent.reloading) {
+    agent.reloadT -= dt;
+    if (agent.reloadT <= 0) {
+      agent.reloading = false;
+      const need = weapon.mag - agent.ammo;
+      const take = Math.min(need, agent.reserve);
+      agent.ammo += take;
+      agent.reserve -= take;
+    }
+    return null;
+  }
+  if (!wantFire) {
+    agent.triggerHeld = false;
+    return null;
+  }
+  if (!weapon.auto && agent.triggerHeld) return null;
+  agent.triggerHeld = true;
+  if (agent.fireCooldown > 0) return null;
+  if (agent.ammo <= 0) {
+    agent.fireCooldown = 0.25; // dry-fire click
+    state.sounds.push({ tick: state.tick, type: 'dry', x: agent.pos.x, z: agent.pos.z });
+    return { dry: true };
+  }
+  agent.fireCooldown = weapon.fireInterval;
+  agent.ammo -= 1;
+  agent.shotsFired = (agent.shotsFired || 0) + 1;
+  agent.bloom = Math.min(weapon.recoilMax, agent.bloom + weapon.recoil);
+  agent.recoilKick = Math.min(0.09, (agent.recoilKick || 0) + 0.014);
+  const result = fireShot(state, agent);
+  state.sounds.push({
+    tick: state.tick,
+    type: 'shot',
+    weapon: agent.weapon,
+    x: agent.pos.x,
+    z: agent.pos.z,
+  });
+  // Gunfire is loud: bots inside 26 m hear it and turn toward the sound.
+  for (const other of state.agents) {
+    if (!other.alive || other.id === agent.id || !other.bot) continue;
+    const dx = other.pos.x - agent.pos.x;
+    const dz = other.pos.z - agent.pos.z;
+    if (dx * dx + dz * dz < 26 * 26) {
+      other.heardAt = { x: agent.pos.x, z: agent.pos.z, tick: state.tick };
+    }
+  }
+  return result;
+}
+
+/** Start a reload if the magazine is not full and reserve ammo remains. */
+export function startReload(state, agent) {
+  const weapon = WEAPONS[agent.weapon];
+  if (agent.reloading || agent.ammo >= weapon.mag || agent.reserve <= 0) return false;
+  agent.reloading = true;
+  agent.reloadT = weapon.reloadTime;
+  state.sounds.push({ tick: state.tick, type: 'reload', x: agent.pos.x, z: agent.pos.z });
+  return true;
 }

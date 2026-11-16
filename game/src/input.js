@@ -1,84 +1,95 @@
-// Keyboard and mouse, plus the pointer lock that turns the mouse into
-// look. Plain browser APIs only. The game asks the canvas for pointer lock
-// and reads movementX/Y while it holds it. Buy (KeyB), grenade (KeyG),
-// plant/defuse (KeyE) and zoom (right mouse) are keys like any other:
-// main.js reads them from state.keys, so a headless test can drive the
-// game by dispatching keyboard events and never needs a real mouse.
-export function createInput(canvas, onLockChange) {
-  const keys = new Set();
-  const state = {
-    keys,
-    locked: false,
-    firing: false,
-    zooming: false,
-    lookX: 0,
-    lookY: 0,
-    // Edge-triggered presses: main.js consumes each one once per frame.
-    pressed: new Set(),
-  };
+// input.js — Keyboard, mouse and pointer lock for the browser.
+// Produces the same input snapshot player.js consumes. Edge-triggered
+// actions (jump, reload, flash, weapon switch) are queued as flags and
+// consumed by the simulation step.
 
-  function setKey(event, down) {
-    if (down) {
-      if (!keys.has(event.code)) state.pressed.add(event.code);
-      keys.add(event.code);
-    } else {
-      keys.delete(event.code);
+import { freshInput } from './player.js';
+
+const WEAPON_KEYS = { Digit1: 'pistol', Digit2: 'smg', Digit3: 'rifle', Digit4: 'marksman' };
+
+/**
+ * Attach input handling to a canvas.
+ * opts: { onLockChange(locked), onBuyToggle(), onCycleWeapon(dir),
+ *         onAnyGesture() } — callbacks the game wires up.
+ * Returns { input, locked(), lock(), unlock() }.
+ */
+export function createInput(canvas, opts = {}) {
+  const input = freshInput();
+  let locked = false;
+
+  function onKeyDown(e) {
+    if (e.code === 'Space') {
+      input.jumpQueued = true;
+      e.preventDefault();
     }
-    if (event.code === 'Space') event.preventDefault();
+    if (e.code === 'KeyR') input.reloadQueued = true;
+    if (e.code === 'KeyF') input.flashQueued = true;
+    if (WEAPON_KEYS[e.code]) input.switchTo = WEAPON_KEYS[e.code];
+    if (e.code === 'KeyB' && opts.onBuyToggle) opts.onBuyToggle();
+    if (e.code === 'Tab') e.preventDefault();
+    input.keys.add(e.code);
   }
 
-  window.addEventListener('keydown', (event) => setKey(event, true));
-  window.addEventListener('keyup', (event) => setKey(event, false));
-  window.addEventListener('blur', () => {
-    keys.clear();
-    state.firing = false;
-    state.zooming = false;
-  });
-  window.addEventListener('mousemove', (event) => {
-    if (!state.locked) return;
-    state.lookX += event.movementX;
-    state.lookY += event.movementY;
-  });
-  window.addEventListener('mousedown', (event) => {
-    if (!state.locked) return;
-    if (event.button === 0) state.firing = true;
-    if (event.button === 2) state.zooming = true;
-  });
-  window.addEventListener('mouseup', (event) => {
-    if (event.button === 0) state.firing = false;
-    if (event.button === 2) state.zooming = false;
-  });
-  window.addEventListener('contextmenu', (event) => event.preventDefault());
-  document.addEventListener('pointerlockchange', () => {
-    state.locked = document.pointerLockElement === canvas;
-    if (!state.locked) {
-      keys.clear();
-      state.firing = false;
-      state.zooming = false;
-    }
-    onLockChange(state.locked);
-  });
+  function onKeyUp(e) {
+    input.keys.delete(e.code);
+  }
+
+  function onMouseDown(e) {
+    if (e.button === 0) input.mouseDown = true;
+  }
+
+  function onMouseUp(e) {
+    if (e.button === 0) input.mouseDown = false;
+  }
+
+  function onMouseMove(e) {
+    if (!locked) return;
+    input.mouseDX += e.movementX || 0;
+    input.mouseDY += e.movementY || 0;
+  }
+
+  function onWheel(e) {
+    if (opts.onCycleWeapon) opts.onCycleWeapon(e.deltaY > 0 ? 1 : -1);
+  }
+
+  function onLockChange() {
+    locked = document.pointerLockElement === canvas;
+    if (!locked) input.mouseDown = false;
+    if (opts.onLockChange) opts.onLockChange(locked);
+  }
+
+  function onContextMenu(e) {
+    e.preventDefault();
+  }
+
+  window.addEventListener('keydown', onKeyDown);
+  window.addEventListener('keyup', onKeyUp);
+  window.addEventListener('mousedown', onMouseDown);
+  window.addEventListener('mouseup', onMouseUp);
+  window.addEventListener('mousemove', onMouseMove);
+  window.addEventListener('wheel', onWheel);
+  document.addEventListener('pointerlockchange', onLockChange);
+  canvas.addEventListener('contextmenu', onContextMenu);
 
   return {
-    state,
-    requestLock() {
+    input,
+    locked: () => locked,
+    lock() {
+      if (opts.onAnyGesture) opts.onAnyGesture();
       canvas.requestPointerLock();
     },
-    takeLook() {
-      const x = state.lookX;
-      const y = state.lookY;
-      state.lookX = 0;
-      state.lookY = 0;
-      return { x, y };
+    unlock() {
+      if (document.pointerLockElement) document.exitPointerLock();
     },
-    // Consume one edge-triggered press; true only on the frame it lands.
-    consume(code) {
-      if (!state.pressed.has(code)) return false;
-      state.pressed.delete(code);
-      return true;
-    },
-    clearPressed() {
-      state.pressed.clear();
+    destroy() {
+      window.removeEventListener('keydown', onKeyDown);
+      window.removeEventListener('keyup', onKeyUp);
+      window.removeEventListener('mousedown', onMouseDown);
+      window.removeEventListener('mouseup', onMouseUp);
+      window.removeEventListener('mousemove', onMouseMove);
+      window.removeEventListener('wheel', onWheel);
+      document.removeEventListener('pointerlockchange', onLockChange);
+      canvas.removeEventListener('contextmenu', onContextMenu);
     },
   };
 }
